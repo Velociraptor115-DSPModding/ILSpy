@@ -26,12 +26,22 @@ using System.Reflection.Metadata;
 using Humanizer.Inflections;
 
 using ICSharpCode.Decompiler.CSharp.OutputVisitor;
+using ICSharpCode.Decompiler.DebugInfo;
 using ICSharpCode.Decompiler.TypeSystem;
 using ICSharpCode.Decompiler.TypeSystem.Implementation;
 using ICSharpCode.Decompiler.Util;
 
 namespace ICSharpCode.Decompiler.IL.Transforms
 {
+	
+	public interface IAssignVariableNamesVariablesHook
+	{
+	#nullable enable
+		string? PreGenerateName(ILTransformContext context, ILVariable variable);
+	#nullable  disable
+		string PostGenerateName(ILTransformContext context, ILVariable variable, string proposedName);
+	}
+	
 	public class AssignVariableNames : IILTransform
 	{
 		static readonly Dictionary<string, string> typeNameToVariableNameDict = new Dictionary<string, string> {
@@ -265,7 +275,7 @@ namespace ICSharpCode.Decompiler.IL.Transforms
 				if (!mapping.TryGetValue(v, out string name))
 				{
 					if (string.IsNullOrEmpty(v.Name))
-						v.Name = GenerateNameForVariable(v);
+						v.Name = GenerateNameForVariableIntercept(v);
 					mapping.Add(v, v.Name);
 				}
 				else
@@ -378,25 +388,41 @@ namespace ICSharpCode.Decompiler.IL.Transforms
 			return loopCounters;
 		}
 
-		string GenerateNameForVariable(ILVariable variable)
+		string GenerateNameForVariableIntercept(ILVariable variable)
 		{
-			string proposedName = null;
-			if (variable.Type.IsKnownType(KnownTypeCode.Int32))
+			if (context.DebugInfo is IAssignVariableNamesVariablesHook avnHook)
 			{
-				// test whether the variable might be a loop counter
-				if (loopCounters.Contains(variable))
+				var initialProposedName = avnHook.PreGenerateName(this.context, variable);
+				var result = GenerateNameForVariable(variable, initialProposedName);
+				return avnHook.PostGenerateName(this.context, variable, result);
+			}
+
+			return GenerateNameForVariable(variable);
+		}
+
+		string GenerateNameForVariable(ILVariable variable, string initialProposedName = null)
+		{
+			string proposedName = initialProposedName;
+			if (string.IsNullOrEmpty(proposedName))
+			{
+				if (variable.Type.IsKnownType(KnownTypeCode.Int32))
 				{
-					// For loop variables, use i,j,k,l,m,n
-					for (char c = 'i'; c <= maxLoopVariableName; c++)
+					// test whether the variable might be a loop counter
+					if (loopCounters.Contains(variable))
 					{
-						if (!reservedVariableNames.ContainsKey(c.ToString()))
+						// For loop variables, use i,j,k,l,m,n
+						for (char c = 'i'; c <= maxLoopVariableName; c++)
 						{
-							proposedName = c.ToString();
-							break;
+							if (!reservedVariableNames.ContainsKey(c.ToString()))
+							{
+								proposedName = c.ToString();
+								break;
+							}
 						}
 					}
 				}
 			}
+
 			// The ComponentResourceManager inside InitializeComponent must be named "resources",
 			// otherwise the WinForms designer won't load the Form.
 			if (CSharp.CSharpDecompiler.IsWindowsFormsInitializeComponentMethod(context.Function.Method) && variable.Type.FullName == "System.ComponentModel.ComponentResourceManager")
