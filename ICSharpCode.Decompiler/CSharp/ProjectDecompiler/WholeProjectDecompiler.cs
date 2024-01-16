@@ -133,16 +133,16 @@ namespace ICSharpCode.Decompiler.CSharp.ProjectDecompiler
 		HashSet<string> directories = new HashSet<string>(Platform.FileNameComparer);
 		readonly IProjectFileWriter projectWriter;
 
-		public void DecompileProject(PEFile moduleDefinition, string targetDirectory, CancellationToken cancellationToken = default(CancellationToken))
+		public void DecompileProject(PEFile moduleDefinition, string targetDirectory, Stream pdbStream = null, CancellationToken cancellationToken = default(CancellationToken))
 		{
 			string projectFileName = Path.Combine(targetDirectory, CleanUpFileName(moduleDefinition.Name) + ".csproj");
 			using (var writer = new StreamWriter(projectFileName))
 			{
-				DecompileProject(moduleDefinition, targetDirectory, writer, cancellationToken);
+				DecompileProject(moduleDefinition, targetDirectory, writer, pdbStream, cancellationToken);
 			}
 		}
 
-		public ProjectId DecompileProject(PEFile moduleDefinition, string targetDirectory, TextWriter projectFileWriter, CancellationToken cancellationToken = default(CancellationToken))
+		public ProjectId DecompileProject(PEFile moduleDefinition, string targetDirectory, TextWriter projectFileWriter, Stream pdbStream = null, CancellationToken cancellationToken = default(CancellationToken))
 		{
 			if (string.IsNullOrEmpty(targetDirectory))
 			{
@@ -151,7 +151,7 @@ namespace ICSharpCode.Decompiler.CSharp.ProjectDecompiler
 			TargetDirectory = targetDirectory;
 			directories.Clear();
 			var resources = WriteResourceFilesInProject(moduleDefinition).ToList();
-			var files = WriteCodeFilesInProject(moduleDefinition, resources.SelectMany(r => r.PartialTypes ?? Enumerable.Empty<PartialTypeInfo>()).ToList(), cancellationToken).ToList();
+			var files = WriteCodeFilesInProject(moduleDefinition, resources.SelectMany(r => r.PartialTypes ?? Enumerable.Empty<PartialTypeInfo>()).ToList(), pdbStream, cancellationToken).ToList();
 			files.AddRange(resources);
 			files.AddRange(WriteMiscellaneousFilesInProject(moduleDefinition));
 			if (StrongNameKeyFile != null)
@@ -208,9 +208,13 @@ namespace ICSharpCode.Decompiler.CSharp.ProjectDecompiler
 			return new[] { new ProjectItemInfo("Compile", assemblyInfo) };
 		}
 
-		IEnumerable<ProjectItemInfo> WriteCodeFilesInProject(Metadata.PEFile module, IList<PartialTypeInfo> partialTypes, CancellationToken cancellationToken)
+		IEnumerable<ProjectItemInfo> WriteCodeFilesInProject(Metadata.PEFile module, IList<PartialTypeInfo> partialTypes, Stream pdbStream, CancellationToken cancellationToken)
 		{
 			var metadata = module.Metadata;
+			Action<CSharpDecompiler, SyntaxTree, string, string> pdbProcessFile = null;
+			Action pdbComplete = null;
+			if (pdbStream != null)
+				(pdbProcessFile, pdbComplete) = PortablePdbWriter.WritePdbInternal(module, pdbStream);
 			var files = module.Metadata.GetTopLevelTypeDefinitions().Where(td => IncludeTypeWhenDecompilingProject(module, td))
 				.GroupBy(GetFileFileNameForHandle, StringComparer.OrdinalIgnoreCase).ToList();
 			var progressReporter = ProgressIndicator;
@@ -228,6 +232,7 @@ namespace ICSharpCode.Decompiler.CSharp.ProjectDecompiler
 				files.AddRange(additionalFiles);
 				progress.TotalUnits = files.Count;
 			}
+			pdbComplete?.Invoke();
 
 			return files.Select(f => new ProjectItemInfo("Compile", f.Key)).Concat(WriteAssemblyInfo(ts, cancellationToken));
 
@@ -261,7 +266,9 @@ namespace ICSharpCode.Decompiler.CSharp.ProjectDecompiler
 					delegate (IGrouping<string, TypeDefinitionHandle> file) {
 						try
 						{
-							using StreamWriter w = new StreamWriter(Path.Combine(TargetDirectory, file.Key));
+							using StringWriter w = new StringWriter();
+							TokenWriter tokenWriter = new TextWriterTokenWriter(w);
+							tokenWriter = TokenWriter.WrapInWriterThatSetsLocationsInAST(tokenWriter);
 							CSharpDecompiler decompiler = CreateDecompiler(ts);
 
 							foreach (var partialType in partialTypes)
@@ -291,7 +298,10 @@ namespace ICSharpCode.Decompiler.CSharp.ProjectDecompiler
 								}
 							}
 
-							syntaxTree.AcceptVisitor(new CSharpOutputVisitor(w, Settings.CSharpFormattingOptions));
+							syntaxTree.AcceptVisitor(new CSharpOutputVisitor(tokenWriter, Settings.CSharpFormattingOptions));
+							var sourceText = w.ToString();
+							File.WriteAllText(Path.Combine(TargetDirectory, file.Key), sourceText);
+							pdbProcessFile?.Invoke(decompiler, syntaxTree, sourceText, file.Key);
 						}
 						catch (Exception innerException) when (!(innerException is OperationCanceledException || innerException is DecompilerException))
 						{
